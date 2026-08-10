@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#12121a">
+<title>PartySpeakers — телефоны как колонки</title>
+<style>
+  :root{
+    --bg:#12121a; --card:#1c1c28; --card2:#252534; --text:#f2f2f7; --muted:#8e8ea3;
+    --accent:#ff5470; --accent2:#ffb347; --ok:#3ddc84;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+  html,body{margin:0; padding:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; min-height:100%;}
+  body{display:flex; flex-direction:column; align-items:center;}
+  .screen{display:none; width:100%; max-width:480px; padding:20px; flex-direction:column; gap:16px;}
+  .screen.active{display:flex;}
+  h1{font-size:26px; margin:8px 0 0; text-align:center;}
+  h1 .logo{color:var(--accent);}
+  .sub{color:var(--muted); text-align:center; margin:0 0 8px; font-size:15px; line-height:1.4;}
+  .card{background:var(--card); border-radius:16px; padding:16px;}
+  button{font-family:inherit; border:none; border-radius:14px; cursor:pointer; color:var(--text);}
+  .btn-main{background:var(--accent); font-size:18px; font-weight:600; padding:16px; width:100%;}
+  .btn-second{background:var(--card2); font-size:18px; font-weight:600; padding:16px; width:100%;}
+  .btn-main:active,.btn-second:active{transform:scale(.98);}
+  input[type=text],input[type=tel]{width:100%; padding:14px; font-size:22px; border-radius:12px;
+    border:1px solid #333348; background:var(--card2); color:var(--text); text-align:center; letter-spacing:6px;}
+  .code-big{font-size:44px; letter-spacing:10px; text-align:center; font-weight:700; color:var(--accent2); margin:4px 0;}
+  .row{display:flex; gap:10px; align-items:center;}
+  .row>*{flex:1;}
+  .muted{color:var(--muted); font-size:13px;}
+  .center{text-align:center;}
+  /* speaker button */
+  .speaker-wrap{display:flex; flex-direction:column; align-items:center; gap:14px; padding:24px 0;}
+  .speaker-btn{width:200px; height:200px; border-radius:50%; background:var(--card2);
+    display:flex; align-items:center; justify-content:center; font-size:90px; position:relative;
+    border:4px solid #333348; transition:border-color .3s;}
+  .speaker-btn.on{border-color:var(--ok);}
+  .speaker-btn.on.playing{animation:pulse 1s infinite;}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(61,220,132,.5);}70%{box-shadow:0 0 0 26px rgba(61,220,132,0);}100%{box-shadow:0 0 0 0 rgba(61,220,132,0);}}
+  .track{display:flex; align-items:center; gap:10px; padding:10px 4px; border-bottom:1px solid #2c2c3c;}
+  .track:last-child{border-bottom:none;}
+  .track .name{flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:15px;}
+  .track.current .name{color:var(--accent2); font-weight:600;}
+  .track button{background:var(--card2); padding:8px 12px; font-size:15px; border-radius:10px;}
+  .controls{display:flex; gap:10px;}
+  .controls button{flex:1; font-size:26px; padding:14px; background:var(--card2); border-radius:14px;}
+  .controls button.play{background:var(--accent);}
+  input[type=range]{width:100%; accent-color:var(--accent);}
+  input[type=file]{display:none;}
+  .status-dot{display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--muted); margin-right:6px;}
+  .status-dot.ok{background:var(--ok);}
+  .qr{display:block; margin:10px auto; border-radius:12px; background:#fff; padding:8px; width:180px; height:180px;}
+  #setup-overlay{position:fixed; inset:0; background:var(--bg); z-index:50; padding:24px; overflow:auto; display:none;}
+  #setup-overlay code{background:var(--card2); padding:2px 6px; border-radius:6px; font-size:13px; display:inline-block; word-break:break-all;}
+  a{color:var(--accent2);}
+  .toast{position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:var(--card2);
+    padding:12px 20px; border-radius:12px; font-size:14px; opacity:0; transition:opacity .3s; pointer-events:none; z-index:99; max-width:90%;}
+  .toast.show{opacity:1;}
+</style>
+</head>
+<body>
+
+<!-- ============ НАСТРОЙКА FIREBASE ============ -->
+<script>
+// Впишите данные своего проекта Firebase (Realtime Database, europe-west1,
+// правила на время теста: {".read": true, ".write": true}).
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyCGS2oYUCSNoDVJkRBBhy5OaKB9Ndltezk",
+  databaseURL: "https://party-speakers-default-rtdb.europe-west1.firebasedatabase.app"
+};
+const START_DELAY_MS = 2500;      // отложенный старт: команда играть «через 2,5 с серверного времени»
+const DRIFT_CHECK_MS = 10000;     // как часто сверяем позицию
+const DRIFT_SOFT_S   = 0.045;     // > 45 мс — мягкая коррекция скоростью
+const DRIFT_HARD_S   = 0.30;      // > 300 мс — жёсткий перезапуск с нужной позиции
+const MAX_FILE_MB    = 10;
+</script>
+
+<div id="setup-overlay">
+  <h1><span class="logo">Party</span>Speakers</h1>
+  <p>Прототип не настроен. Нужно 5 минут:</p>
+  <ol style="line-height:1.7; font-size:15px;">
+    <li>Firebase → новый проект → Realtime Database (europe-west1).</li>
+    <li>Правила на время теста: <code>{".read": true, ".write": true}</code></li>
+    <li>В начале этого файла впишите <code>apiKey</code> и <code>databaseURL</code>.</li>
+    <li>Выложите файл на GitHub Pages и откройте с нескольких телефонов.</li>
+  </ol>
+</div>
+
+<!-- ============ ЭКРАН: СТАРТ ============ -->
+<div class="screen active" id="scr-home">
+  <h1><span class="logo">Party</span>Speakers</h1>
+  <p class="sub">Нет колонки? Есть 20 телефонов.<br>Один хост — все остальные играют в такт.</p>
+  <button class="btn-main" onclick="createParty()">Создать вечеринку</button>
+  <div class="card">
+    <p class="muted center" style="margin-top:0">Подключиться к вечеринке</p>
+    <input type="tel" id="join-code" maxlength="4" placeholder="КОД" inputmode="numeric">
+    <div style="height:10px"></div>
+    <button class="btn-second" onclick="joinParty()">Стать колонкой 🔊</button>
+  </div>
+</div>
+
+<!-- ============ ЭКРАН: ХОСТ ============ -->
+<div class="screen" id="scr-host">
+  <p class="sub" style="margin:0">Код вечеринки</p>
+  <div class="code-big" id="host-code">— — — —</div>
+  <img class="qr" id="host-qr" alt="QR для гостей">
+  <p class="muted center" id="host-speakers">Колонок подключено: 0</p>
+
+  <div class="card">
+    <div class="controls">
+      <button onclick="hostPrev()">⏮</button>
+      <button class="play" id="btn-playpause" onclick="hostPlayPause()">▶️</button>
+      <button onclick="hostNext()">⏭</button>
+    </div>
+    <div style="height:10px"></div>
+    <p class="muted center" id="host-nowplaying">Загрузите треки и нажмите play</p>
+  </div>
+
+  <div class="card">
+    <label for="file-input"><div class="btn-second" style="text-align:center">+ Добавить MP3 с телефона</div></label>
+    <input type="file" id="file-input" accept="audio/*" multiple onchange="uploadFiles(this.files)">
+    <div id="playlist"></div>
+  </div>
+
+  <div class="card">
+    <p class="muted" style="margin:0 0 6px">Мой телефон тоже колонка</p>
+    <div class="row">
+      <button class="btn-second" id="host-self-speaker" onclick="toggleSelfSpeaker()">Включить звук у себя</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ ЭКРАН: КОЛОНКА ============ -->
+<div class="screen" id="scr-speaker">
+  <p class="sub" style="margin:0">Вечеринка <b id="spk-code"></b></p>
+  <div class="speaker-wrap">
+    <div class="speaker-btn" id="spk-btn" onclick="speakerTap()">🔊</div>
+    <p class="muted center" id="spk-status">Нажмите на динамик, чтобы включиться</p>
+  </div>
+  <div class="card">
+    <p class="muted" style="margin:0">Громкость</p>
+    <input type="range" id="spk-vol" min="0" max="100" value="100" oninput="setVolume(this.value)">
+    <p class="muted" style="margin:10px 0 0">Точная подстройка: <span id="nudge-val">0</span> мс
+      <br><span style="font-size:12px">звук отстаёт от соседей → влево, спешит → вправо</span></p>
+    <input type="range" id="spk-nudge" min="-200" max="200" value="0" step="5" oninput="setNudge(this.value)">
+  </div>
+  <p class="muted center">Не блокируйте экран — телефон сейчас работает колонкой.</p>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script>
+"use strict";
+// ---------- общий каркас ----------
+let db=null, partyCode=null, role=null;
+let clockOffset=0;                 // serverTime - localTime (мс)
+let audioCtx=null, gainNode=null, masterVol=1;
+let nudgeMs = parseInt(localStorage.getItem('ps_nudge')||'0');
+let buffers={};                    // trackId -> AudioBuffer
+let rawTracks={};                  // trackId -> {name, order}
+let curState=null;                 // последний state из базы
+let playingSrc=null, playInfo=null; // playInfo: {trackId, ctxStart, posAtStart, rate}
+let speakerOn=false, myUid='u'+Math.random().toString(36).slice(2,9);
+let driftTimer=null, heartbeatTimer=null;
+
+function $(id){return document.getElementById(id);}
+function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active')); $(id).classList.add('active');}
+function toast(msg){const t=$('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),3000);}
+function serverNow(){return Date.now()+clockOffset;}
+
+function initFirebase(){
+  if(!FIREBASE_CONFIG.databaseURL || FIREBASE_CONFIG.databaseURL.includes('ВПИШИ')){
+    $('setup-overlay').style.display='block'; return false;
+  }
+  firebase.initializeApp(FIREBASE_CONFIG);
+  db=firebase.database();
+  db.ref('.info/serverTimeOffset').on('value', s=>{ clockOffset = s.val()||0; });
+  return true;
+}
+
+function ensureAudio(){
+  if(!audioCtx){
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    gainNode=audioCtx.createGain(); gainNode.connect(audioCtx.destination);
+  }
+  if(audioCtx.state==='suspended') audioCtx.resume();
+}
+
+async function requestWakeLock(){
+  try{ if('wakeLock' in navigator) await navigator.wakeLock.request('screen'); }catch(e){}
+}
+
+// ---------- создание / вход ----------
+function createParty(){
+  if(!db) return;
+  partyCode = (''+Math.floor(1000+Math.random()*9000));
+  role='host';
+  db.ref('parties/'+partyCode).set({ meta:{createdAt:firebase.database.ServerValue.TIMESTAMP} });
+  $('host-code').textContent = partyCode.split('').join(' ');
+  const link = location.origin+location.pathname+'?p='+partyCode;
+  $('host-qr').src = 'https://api.qrserver.com/v1/create-qr-code/?size=180x180&data='+encodeURIComponent(link);
+  listenParty();
+  show('scr-host');
+  requestWakeLock();
+}
+
+function joinParty(codeFromUrl){
+  if(!db) return;
+  const code = codeFromUrl || $('join-code').value.trim();
+  if(!/^\d{4}$/.test(code)){ toast('Введите код из 4 цифр'); return; }
+  db.ref('parties/'+code+'/meta').get().then(s=>{
+    if(!s.exists()){ toast('Вечеринка с таким кодом не найдена'); return; }
+    partyCode=code; role='speaker';
+    $('spk-code').textContent=code;
+    listenParty();
+    heartbeatTimer=setInterval(()=>{
+      db.ref('parties/'+partyCode+'/speakers/'+myUid).set({lastSeen:firebase.database.ServerValue.TIMESTAMP, on:speakerOn});
+    },15000);
+    show('scr-speaker');
+  });
+}
+
+// ---------- подписки на базу ----------
+function listenParty(){
+  const base='parties/'+partyCode;
+  db.ref(base+'/tracks').on('child_added', s=>{
+    const v=s.val();
+    rawTracks[s.key]={name:v.name, order:v.order};
+    if(role==='host') renderPlaylist();
+    decodeTrack(s.key, v.data);           // все устройства декодируют сразу — предзагрузка
+  });
+  db.ref(base+'/state').on('value', s=>{
+    curState=s.val();
+    onStateChange();
+    if(role==='host') renderHostState();
+  });
+  if(role==='host'){
+    db.ref(base+'/speakers').on('value', s=>{
+      let n=0; const now=serverNow();
+      s.forEach(c=>{ const v=c.val(); if(v.on && now-(v.lastSeen||0)<45000) n++; });
+      $('host-speakers').textContent='Колонок подключено: '+n;
+    });
+  }
+}
+
+async function decodeTrack(id, b64){
+  try{
+    ensureAudioSilent();
+    const bin=atob(b64); const arr=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
+    const buf=await audioCtx.decodeAudioData(arr.buffer);
+    buffers[id]=buf;
+    onStateChange(); // вдруг этот трек уже играет
+  }catch(e){ console.warn('decode fail', e); }
+}
+function ensureAudioSilent(){ // контекст нужен для decode даже до жеста
+  if(!audioCtx){
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    gainNode=audioCtx.createGain(); gainNode.connect(audioCtx.destination);
+  }
+}
+
+// ---------- ядро синхронизации ----------
+function outputLatencyS(){
+  if(!audioCtx) return 0;
+  return audioCtx.outputLatency || audioCtx.baseLatency || 0;
+}
+
+function stopLocal(){
+  if(playingSrc){ try{playingSrc.stop();}catch(e){} playingSrc=null; }
+  playInfo=null;
+  if(driftTimer){ clearInterval(driftTimer); driftTimer=null; }
+  updateSpeakerVisual(false);
+}
+
+function onStateChange(){
+  const st=curState;
+  if(!st || st.action!=='play'){ stopLocal(); return; }
+  const iPlay = (role==='speaker' && speakerOn) || (role==='host' && speakerOn);
+  if(!iPlay) { stopLocal(); return; }
+  const buf=buffers[st.trackId];
+  if(!buf) return; // ещё качается/декодируется — onStateChange вызовется снова после decode
+  startSynced(st, buf);
+}
+
+function startSynced(st, buf){
+  stopLocal();
+  ensureAudio();
+  // где должен быть трек прямо сейчас по серверным часам
+  const elapsedS = (serverNow() - st.startAt)/1000;           // может быть <0: старт в будущем
+  const targetPos = st.seekOffset + Math.max(0, elapsedS);
+  if(targetPos >= buf.duration) return;                       // трек уже кончился
+
+  const src=audioCtx.createBufferSource();
+  src.buffer=buf; src.connect(gainNode);
+  const nudgeS = nudgeMs/1000;
+
+  if(elapsedS < 0){
+    // старт в будущем: планируем по аудиочасам с точностью до сэмпла
+    const when = audioCtx.currentTime + (-elapsedS) - outputLatencyS() - nudgeS;
+    src.start(Math.max(when, audioCtx.currentTime), st.seekOffset);
+    playInfo={trackId:st.trackId, ctxStart:Math.max(when,audioCtx.currentTime), posAtStart:st.seekOffset, rate:1};
+  }else{
+    // подключились посреди трека: входим с нужной позиции
+    const pos = targetPos + outputLatencyS() + nudgeS;
+    src.start(audioCtx.currentTime, Math.min(pos, buf.duration-0.05));
+    playInfo={trackId:st.trackId, ctxStart:audioCtx.currentTime, posAtStart:pos, rate:1};
+  }
+  playingSrc=src;
+  src.onended=()=>{ if(role==='host' && playingSrc===src) hostNext(true); };
+  updateSpeakerVisual(true);
+  driftTimer=setInterval(checkDrift, DRIFT_CHECK_MS);
+}
+
+function currentLocalPos(){
+  if(!playInfo) return null;
+  return playInfo.posAtStart + (audioCtx.currentTime - playInfo.ctxStart)*playInfo.rate;
+}
+
+function checkDrift(){
+  const st=curState;
+  if(!st || st.action!=='play' || !playingSrc || !playInfo) return;
+  const target = st.seekOffset + (serverNow()-st.startAt)/1000 + nudgeMs/1000;
+  const actual = currentLocalPos();
+  if(actual==null) return;
+  const diff = actual - target;   // >0 — спешим, <0 — отстаём
+  if(Math.abs(diff) > DRIFT_HARD_S){
+    startSynced(st, buffers[st.trackId]);            // жёстко пересаживаемся
+  }else if(Math.abs(diff) > DRIFT_SOFT_S){
+    // мягко: меняем скорость на 0.5% так, чтобы за ~diff/0.005 секунд догнать
+    const rate = diff>0 ? 0.995 : 1.005;
+    const secs = Math.min(Math.abs(diff)/0.005, 8);
+    // фиксируем позицию на момент смены скорости
+    playInfo={...playInfo, posAtStart:actual, ctxStart:audioCtx.currentTime, rate:rate};
+    playingSrc.playbackRate.setValueAtTime(rate, audioCtx.currentTime);
+    playingSrc.playbackRate.setValueAtTime(1, audioCtx.currentTime+secs);
+    setTimeout(()=>{ if(playInfo){ playInfo={...playInfo, posAtStart:currentLocalPos(), ctxStart:audioCtx.currentTime, rate:1}; } }, secs*1000+50);
+  }
+}
+
+// ---------- хост: управление ----------
+let trackOrder=[]; let uploadCounter=0;
+function renderPlaylist(){
+  trackOrder=Object.keys(rawTracks).sort((a,b)=>rawTracks[a].order-rawTracks[b].order);
+  const cur = curState && curState.trackId;
+  $('playlist').innerHTML = trackOrder.map(id=>
+    `<div class="track ${id===cur?'current':''}">
+       <span class="status-dot ${buffers[id]?'ok':''}"></span>
+       <span class="name">${rawTracks[id].name}</span>
+       <button onclick="hostPlayTrack('${id}')">▶</button>
+     </div>`).join('');
+}
+function renderHostState(){
+  renderPlaylist();
+  const st=curState;
+  if(st && st.action==='play' && rawTracks[st.trackId]){
+    $('btn-playpause').textContent='⏸';
+    $('host-nowplaying').textContent='Играет: '+rawTracks[st.trackId].name;
+  }else{
+    $('btn-playpause').textContent='▶️';
+    $('host-nowplaying').textContent = st && st.action==='pause' ? 'Пауза' : 'Загрузите треки и нажмите play';
+  }
+}
+
+function uploadFiles(files){
+  [...files].forEach(f=>{
+    if(f.size > MAX_FILE_MB*1024*1024){ toast(f.name+': больше '+MAX_FILE_MB+' МБ, пропускаю'); return; }
+    const r=new FileReader();
+    r.onload=()=>{
+      const b64=r.result.split(',')[1];
+      db.ref('parties/'+partyCode+'/tracks').push({
+        name:f.name.replace(/\.[^.]+$/,''), order:Date.now()+(uploadCounter++), data:b64
+      }).then(()=>toast('Загружен: '+f.name)).catch(e=>toast('Ошибка загрузки: '+e.message));
+    };
+    r.readAsDataURL(f);
+  });
+}
+
+function setState(obj){ db.ref('parties/'+partyCode+'/state').set(obj); }
+
+function hostPlayTrack(id, seek=0){
+  setState({action:'play', trackId:id, seekOffset:seek, startAt: serverNow()+START_DELAY_MS});
+}
+function hostPlayPause(){
+  const st=curState;
+  if(st && st.action==='play'){
+    const pos = st.seekOffset + (serverNow()-st.startAt)/1000;
+    setState({action:'pause', trackId:st.trackId, seekOffset:Math.max(0,pos), startAt:0});
+  }else if(st && st.action==='pause'){
+    hostPlayTrack(st.trackId, st.seekOffset);
+  }else if(trackOrder.length){
+    hostPlayTrack(trackOrder[0]);
+  }
+}
+function hostStep(dir){
+  if(!trackOrder.length) return;
+  const cur = curState ? trackOrder.indexOf(curState.trackId) : -1;
+  const next = ((cur<0?0:cur+dir)+trackOrder.length)%trackOrder.length;
+  hostPlayTrack(trackOrder[next]);
+}
+function hostNext(auto){ hostStep(1); }
+function hostPrev(){ hostStep(-1); }
+
+function toggleSelfSpeaker(){
+  ensureAudio(); requestWakeLock();
+  speakerOn=!speakerOn;
+  $('host-self-speaker').textContent = speakerOn?'Выключить звук у себя':'Включить звук у себя';
+  onStateChange();
+}
+
+// ---------- колонка ----------
+function speakerTap(){
+  ensureAudio(); requestWakeLock();
+  speakerOn=!speakerOn;
+  $('spk-btn').classList.toggle('on', speakerOn);
+  $('spk-status').textContent = speakerOn ? 'Колонка включена. Ждём музыку…' : 'Нажмите на динамик, чтобы включиться';
+  db.ref('parties/'+partyCode+'/speakers/'+myUid).set({lastSeen:firebase.database.ServerValue.TIMESTAMP, on:speakerOn});
+  onStateChange();
+}
+function updateSpeakerVisual(playing){
+  if(role!=='speaker') return;
+  $('spk-btn').classList.toggle('playing', playing && speakerOn);
+  if(speakerOn) $('spk-status').textContent = playing ? 'Играем в такт со всеми 🎶' : 'Колонка включена. Ждём музыку…';
+}
+function setVolume(v){ masterVol=v/100; if(gainNode) gainNode.gain.setTargetAtTime(masterVol, audioCtx.currentTime, .05); }
+function setNudge(v){
+  nudgeMs=parseInt(v); $('nudge-val').textContent=nudgeMs;
+  localStorage.setItem('ps_nudge', nudgeMs);
+  if(curState && curState.action==='play' && buffers[curState.trackId] && speakerOn) startSynced(curState, buffers[curState.trackId]);
+}
+$('nudge-val') && ($('nudge-val').textContent=nudgeMs);
+document.addEventListener('DOMContentLoaded', ()=>{ $('spk-nudge').value=nudgeMs; $('nudge-val').textContent=nudgeMs; });
+
+// ---------- запуск ----------
+if(initFirebase()){
+  const p=new URLSearchParams(location.search).get('p');
+  if(p) joinParty(p);
+}
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) requestWakeLock(); });
+</script>
+</body>
+</html>
