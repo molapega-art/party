@@ -81,7 +81,8 @@ const START_DELAY_MS = 2500;      // отложенный старт: коман
 const DRIFT_CHECK_MS = 10000;     // как часто сверяем позицию
 const DRIFT_SOFT_S   = 0.045;     // > 45 мс — мягкая коррекция скоростью
 const DRIFT_HARD_S   = 0.30;      // > 300 мс — жёсткий перезапуск с нужной позиции
-const MAX_FILE_MB    = 10;
+const MAX_FILE_MB    = 25;
+const CHUNK_CHARS    = 8000000;   // куски base64 по ~8 млн символов: с запасом ниже лимита БД в 10 МБ на запись
 </script>
 
 <div id="setup-overlay">
@@ -153,7 +154,8 @@ const MAX_FILE_MB    = 10;
       <br><span style="font-size:12px">звук отстаёт от соседей → влево, спешит → вправо</span></p>
     <input type="range" id="spk-nudge" min="-200" max="200" value="0" step="5" oninput="setNudge(this.value)">
   </div>
-  <p class="muted center">Не блокируйте экран — телефон сейчас работает колонкой.</p>
+  <p class="muted center">Не блокируйте экран — телефон сейчас работает колонкой.<br>
+  Нет звука? Выключите беззвучный режим (переключатель сбоку) и прибавьте громкость кнопками.</p>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -192,6 +194,8 @@ function dbg(msg, cls){
 }
 window.addEventListener('error', e=>dbg('JS ERROR: '+(e.message||e), 'err'));
 window.addEventListener('unhandledrejection', e=>dbg('PROMISE ERROR: '+(e.reason&&e.reason.message||e.reason), 'err'));
+const APP_VERSION='v4 (нарезка треков до 25 МБ + звук в беззвучном)';
+document.addEventListener('DOMContentLoaded', ()=>dbg('версия приложения: '+APP_VERSION,'ok'));
 
 function initFirebase(){
   if(!FIREBASE_CONFIG.databaseURL || FIREBASE_CONFIG.databaseURL.includes('ВПИШИ')){
@@ -206,6 +210,8 @@ function initFirebase(){
 
 let audioUnlocked=false;
 function ensureAudio(){
+  // iOS: просим систему считать нас «музыкой» — тогда беззвучный режим не глушит звук (iOS 17+)
+  try{ if('audioSession' in navigator && navigator.audioSession.type!=='playback'){ navigator.audioSession.type='playback'; dbg('audioSession=playback: играем даже в беззвучном режиме','ok'); } }catch(e){}
   if(!audioCtx){
     audioCtx=new (window.AudioContext||window.webkitAudioContext)();
     gainNode=audioCtx.createGain(); gainNode.connect(audioCtx.destination);
@@ -264,11 +270,23 @@ function joinParty(codeFromUrl){
 // ---------- подписки на базу ----------
 function listenParty(){
   const base='parties/'+partyCode;
-  db.ref(base+'/tracks').on('child_added', s=>{
+  db.ref(base+'/tracks').on('child_added', async s=>{
     const v=s.val();
     rawTracks[s.key]={name:v.name, order:v.order};
     if(role==='host') renderPlaylist();
-    decodeTrack(s.key, v.data);           // все устройства декодируют сразу — предзагрузка
+    // Новый формат: трек порезан на куски в отдельной ветке. Старый: всё в поле data.
+    if(v.chunks){
+      try{
+        dbg('скачиваю трек «'+v.name+'» ('+v.chunks+' ч.)…');
+        const snap=await db.ref(base+'/trackdata/'+s.key).get();
+        const parts=snap.val();
+        if(!parts){ dbg('нет данных трека «'+v.name+'» в базе','err'); return; }
+        let b64=''; for(let i=0;i<v.chunks;i++) b64+=parts[i]||'';
+        decodeTrack(s.key, b64);
+      }catch(e){ dbg('ошибка скачивания «'+v.name+'»: '+(e&&e.message||e),'err'); }
+    }else{
+      decodeTrack(s.key, v.data);
+    }
   });
   db.ref(base+'/state').on('value', s=>{
     curState=s.val();
@@ -422,9 +440,15 @@ async function uploadFiles(files){
     try{
       dbg('читаю '+f.name+' ('+(f.size/1048576).toFixed(1)+' МБ)…');
       const b64=await new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result.split(',')[1]); r.onerror=()=>rej(r.error); r.readAsDataURL(f); });
-      dbg('пишу в базу '+f.name+'…');
-      await db.ref('parties/'+partyCode+'/tracks').push({
-        name:f.name.replace(/\.[^.]+$/,''), order:Date.now()+(uploadCounter++), data:b64
+      // Режем на куски: лимит базы 10 МБ на одну запись, а base64 на треть больше файла.
+      const id=db.ref('parties/'+partyCode+'/tracks').push().key;
+      const nChunks=Math.ceil(b64.length/CHUNK_CHARS);
+      for(let i=0;i<nChunks;i++){
+        dbg('загружаю '+f.name+': часть '+(i+1)+' из '+nChunks+'…');
+        await db.ref('parties/'+partyCode+'/trackdata/'+id+'/'+i).set(b64.slice(i*CHUNK_CHARS,(i+1)*CHUNK_CHARS));
+      }
+      await db.ref('parties/'+partyCode+'/tracks/'+id).set({
+        name:f.name.replace(/\.[^.]+$/,''), order:Date.now()+(uploadCounter++), chunks:nChunks, size:f.size
       });
       dbg('загружен: '+f.name,'ok'); toast('Загружен: '+f.name);
     }catch(e){
