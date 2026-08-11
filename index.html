@@ -58,6 +58,13 @@
   .toast{position:fixed; bottom:20px; left:50%; transform:translateX(-50%); background:var(--card2);
     padding:12px 20px; border-radius:12px; font-size:14px; opacity:0; transition:opacity .3s; pointer-events:none; z-index:99; max-width:90%;}
   .toast.show{opacity:1;}
+  #dbg{position:fixed; left:0; right:0; bottom:0; max-height:32vh; overflow:auto; background:#0c0c12; border-top:1px solid #2c2c3c;
+    font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11px; line-height:1.5; padding:6px 10px 10px; z-index:80; display:none;}
+  #dbg.show{display:block;}
+  #dbg .l{color:var(--muted); white-space:pre-wrap; word-break:break-word;}
+  #dbg .l.err{color:#ff6b6b;} #dbg .l.ok{color:var(--ok);} #dbg .l.warn{color:var(--accent2);}
+  #dbg-toggle{position:fixed; right:10px; bottom:10px; z-index:81; background:var(--card2); color:var(--muted);
+    border-radius:10px; padding:8px 12px; font-size:12px;}
 </style>
 </head>
 <body>
@@ -150,6 +157,8 @@ const MAX_FILE_MB    = 10;
 </div>
 
 <div class="toast" id="toast"></div>
+<button id="dbg-toggle" onclick="document.getElementById('dbg').classList.toggle('show')">🐞 лог</button>
+<div id="dbg"></div>
 
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
@@ -171,6 +180,18 @@ function $(id){return document.getElementById(id);}
 function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active')); $(id).classList.add('active');}
 function toast(msg){const t=$('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),3000);}
 function serverNow(){return Date.now()+clockOffset;}
+// ---------- экранный лог диагностики ----------
+function dbg(msg, cls){
+  try{
+    const box=$('dbg'); if(!box) return;
+    const d=new Date(); const t=('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);
+    const div=document.createElement('div'); div.className='l'+(cls?' '+cls:''); div.textContent=t+'  '+msg;
+    box.appendChild(div); box.scrollTop=box.scrollHeight;
+    while(box.children.length>200) box.removeChild(box.firstChild);
+  }catch(e){}
+}
+window.addEventListener('error', e=>dbg('JS ERROR: '+(e.message||e), 'err'));
+window.addEventListener('unhandledrejection', e=>dbg('PROMISE ERROR: '+(e.reason&&e.reason.message||e.reason), 'err'));
 
 function initFirebase(){
   if(!FIREBASE_CONFIG.databaseURL || FIREBASE_CONFIG.databaseURL.includes('ВПИШИ')){
@@ -178,16 +199,32 @@ function initFirebase(){
   }
   firebase.initializeApp(FIREBASE_CONFIG);
   db=firebase.database();
-  db.ref('.info/serverTimeOffset').on('value', s=>{ clockOffset = s.val()||0; });
+  db.ref('.info/serverTimeOffset').on('value', s=>{ clockOffset = s.val()||0; dbg('сдвиг часов относительно сервера: '+Math.round(clockOffset)+' мс'); });
+  db.ref('.info/connected').on('value', s=>{ dbg('связь с базой: '+(s.val()?'есть':'нет'), s.val()?'ok':'err'); });
   return true;
 }
 
+let audioUnlocked=false;
 function ensureAudio(){
   if(!audioCtx){
     audioCtx=new (window.AudioContext||window.webkitAudioContext)();
     gainNode=audioCtx.createGain(); gainNode.connect(audioCtx.destination);
+    dbg('AudioContext создан, state='+audioCtx.state);
   }
-  if(audioCtx.state==='suspended') audioCtx.resume();
+  // Разблокировка на мобильных: проигрываем короткий бесшумный буфер В МОМЕНТ касания.
+  if(!audioUnlocked){
+    try{
+      const b=audioCtx.createBuffer(1,1,22050);
+      const s=audioCtx.createBufferSource(); s.buffer=b; s.connect(audioCtx.destination); s.start(0);
+      audioUnlocked=true;
+    }catch(e){ dbg('unlock fail: '+e.message,'warn'); }
+  }
+  if(audioCtx.state==='suspended'){
+    audioCtx.resume().then(()=>{
+      dbg('AudioContext resumed, state='+audioCtx.state,'ok');
+      onStateChange();   // если музыка уже идёт — стартуем ПОСЛЕ пробуждения, а не в спящем контексте
+    }).catch(e=>dbg('resume fail: '+e.message,'err'));
+  }
 }
 
 async function requestWakeLock(){
@@ -235,6 +272,7 @@ function listenParty(){
   });
   db.ref(base+'/state').on('value', s=>{
     curState=s.val();
+    if(curState) dbg('получена команда: '+curState.action+(curState.trackId?' · трек '+(rawTracks[curState.trackId]?rawTracks[curState.trackId].name:curState.trackId):''));
     onStateChange();
     if(role==='host') renderHostState();
   });
@@ -247,15 +285,19 @@ function listenParty(){
   }
 }
 
-async function decodeTrack(id, b64){
+function decodeTrack(id, b64){
+  if(!b64){ dbg('трек '+id+': нет данных (пустой data)','err'); return; }
   try{
     ensureAudioSilent();
     const bin=atob(b64); const arr=new Uint8Array(bin.length);
     for(let i=0;i<bin.length;i++) arr[i]=bin.charCodeAt(i);
-    const buf=await audioCtx.decodeAudioData(arr.buffer);
-    buffers[id]=buf;
-    onStateChange(); // вдруг этот трек уже играет
-  }catch(e){ console.warn('decode fail', e); }
+    dbg('декодирую трек ('+Math.round(bin.length/1024)+' КБ)…');
+    const onOk=buf=>{ buffers[id]=buf; dbg('трек готов: '+(rawTracks[id]?rawTracks[id].name:id)+' ('+buf.duration.toFixed(1)+'с)','ok'); if(role==='host') renderPlaylist(); onStateChange(); };
+    const onErr=e=>dbg('НЕ удалось декодировать трек: '+(e&&e.message||e),'err');
+    // Промис-форма (совр. браузеры) + колбэк-форма (старый Safari) через один вызов
+    const p=audioCtx.decodeAudioData(arr.buffer, onOk, onErr);
+    if(p&&p.then) p.then(onOk).catch(onErr);
+  }catch(e){ dbg('ошибка обработки трека: '+e.message,'err'); }
 }
 function ensureAudioSilent(){ // контекст нужен для decode даже до жеста
   if(!audioCtx){
@@ -280,10 +322,10 @@ function stopLocal(){
 function onStateChange(){
   const st=curState;
   if(!st || st.action!=='play'){ stopLocal(); return; }
-  const iPlay = (role==='speaker' && speakerOn) || (role==='host' && speakerOn);
-  if(!iPlay) { stopLocal(); return; }
+  if(!speakerOn){ dbg('команда «играть» есть, но колонка выключена — жду касания','warn'); stopLocal(); return; }
   const buf=buffers[st.trackId];
-  if(!buf) return; // ещё качается/декодируется — onStateChange вызовется снова после decode
+  if(!buf){ dbg('команда «играть», но трек ещё не готов — жду декодирования','warn'); return; }
+  if(audioCtx && audioCtx.state==='suspended'){ dbg('звук ещё спит — пробуждаю','warn'); ensureAudio(); return; }
   startSynced(st, buf);
 }
 
@@ -313,6 +355,7 @@ function startSynced(st, buf){
   playingSrc=src;
   src.onended=()=>{ if(role==='host' && playingSrc===src) hostNext(true); };
   updateSpeakerVisual(true);
+  dbg('▶ играю «'+(rawTracks[st.trackId]?rawTracks[st.trackId].name:'')+'» с позиции '+playInfo.posAtStart.toFixed(2)+'с','ok');
   driftTimer=setInterval(checkDrift, DRIFT_CHECK_MS);
 }
 
@@ -366,18 +409,30 @@ function renderHostState(){
   }
 }
 
-function uploadFiles(files){
-  [...files].forEach(f=>{
-    if(f.size > MAX_FILE_MB*1024*1024){ toast(f.name+': больше '+MAX_FILE_MB+' МБ, пропускаю'); return; }
-    const r=new FileReader();
-    r.onload=()=>{
-      const b64=r.result.split(',')[1];
-      db.ref('parties/'+partyCode+'/tracks').push({
+async function uploadFiles(files){
+  const list=[...files];
+  dbg('выбрано файлов: '+list.length);
+  // Грузим ПОСЛЕДОВАТЕЛЬНО — параллельные большие записи в RTDB часто срываются.
+  for(const f of list){
+    if(f.size > MAX_FILE_MB*1024*1024){
+      dbg('пропущен '+f.name+' — '+(f.size/1048576).toFixed(1)+' МБ > лимита '+MAX_FILE_MB+' МБ','warn');
+      toast(f.name+': больше '+MAX_FILE_MB+' МБ. Возьмите файл покороче/полегче.');
+      continue;
+    }
+    try{
+      dbg('читаю '+f.name+' ('+(f.size/1048576).toFixed(1)+' МБ)…');
+      const b64=await new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result.split(',')[1]); r.onerror=()=>rej(r.error); r.readAsDataURL(f); });
+      dbg('пишу в базу '+f.name+'…');
+      await db.ref('parties/'+partyCode+'/tracks').push({
         name:f.name.replace(/\.[^.]+$/,''), order:Date.now()+(uploadCounter++), data:b64
-      }).then(()=>toast('Загружен: '+f.name)).catch(e=>toast('Ошибка загрузки: '+e.message));
-    };
-    r.readAsDataURL(f);
-  });
+      });
+      dbg('загружен: '+f.name,'ok'); toast('Загружен: '+f.name);
+    }catch(e){
+      dbg('ОШИБКА загрузки '+f.name+': '+(e&&e.message||e),'err');
+      toast('Ошибка загрузки '+f.name+': '+(e&&e.message||e));
+    }
+  }
+  $('file-input').value='';   // сброс, чтобы можно было добавлять по одному
 }
 
 function setState(obj){ db.ref('parties/'+partyCode+'/state').set(obj); }
@@ -414,8 +469,10 @@ function toggleSelfSpeaker(){
 
 // ---------- колонка ----------
 function speakerTap(){
+  dbg('касание динамика');
   ensureAudio(); requestWakeLock();
   speakerOn=!speakerOn;
+  dbg('колонка '+(speakerOn?'ВКЛ':'выкл'));
   $('spk-btn').classList.toggle('on', speakerOn);
   $('spk-status').textContent = speakerOn ? 'Колонка включена. Ждём музыку…' : 'Нажмите на динамик, чтобы включиться';
   db.ref('parties/'+partyCode+'/speakers/'+myUid).set({lastSeen:firebase.database.ServerValue.TIMESTAMP, on:speakerOn});
