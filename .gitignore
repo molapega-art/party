@@ -1,0 +1,12 @@
+# секреты — только локально
+.env
+.env.*
+
+# firebase CLI
+.firebase/
+firebase-debug.log
+database-debug.log
+ui-debug.log
+
+# системное
+.DS_Store

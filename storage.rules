@@ -1,0 +1,20 @@
+rules_version = '2';
+
+// PartySpeakers — аудио вечеринок лежит в party-audio/<код>/<файл>.
+// Прототип без авторизации: читать может любой (колонки качают трек),
+// писать — тоже любой, но только аудио и не больше 30 МБ на файл.
+// Хардненинг на будущее: включить Anonymous Auth и заменить write-условие на
+// `request.auth != null && ...`.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /party-audio/{code}/{allPaths=**} {
+      allow read: if true;
+      allow write: if request.resource.size < 30 * 1024 * 1024
+                   && request.resource.contentType.matches('audio/.*');
+      allow delete: if true;
+    }
+    match /{other=**} {
+      allow read, write: if false;
+    }
+  }
+}

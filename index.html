@@ -43,7 +43,12 @@
   .track:last-child{border-bottom:none;}
   .track .name{flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:15px;}
   .track.current .name{color:var(--accent2); font-weight:600;}
-  .track button{background:var(--card2); padding:8px 12px; font-size:15px; border-radius:10px;}
+  .track button{background:var(--card2); padding:8px 10px; font-size:14px; border-radius:10px; flex:none;}
+  .track button:disabled{opacity:.3;}
+  .track button.del{color:var(--accent);}
+  .progress .bar{height:6px; background:var(--card2); border-radius:6px; overflow:hidden; margin:8px 0 4px;}
+  .progress .fill{height:100%; width:0; background:var(--accent); transition:width .4s linear;}
+  .spk-row{display:flex; align-items:center; gap:6px; padding:3px 0;}
   .controls{display:flex; gap:10px;}
   .controls button{flex:1; font-size:26px; padding:14px; background:var(--card2); border-radius:14px;}
   .controls button.play{background:var(--accent);}
@@ -71,16 +76,24 @@
 
 <!-- ============ НАСТРОЙКА FIREBASE ============ -->
 <script>
-// Впишите данные своего проекта Firebase (Realtime Database, europe-west1,
-// правила на время теста: {".read": true, ".write": true}).
+// Конфиг веб-приложения Firebase. apiKey здесь — НЕ секрет: у Firebase Web
+// он публичный по дизайну (идентификатор проекта, а не пароль). Безопасность
+// обеспечивают правила базы/Storage (см. database.rules.json, storage.rules),
+// а не сокрытие ключа. Поэтому конфиг спокойно лежит в статике на GitHub Pages.
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyCGS2oYUCSNoDVJkRBBhy5OaKB9Ndltezk",
-  databaseURL: "https://party-speakers-default-rtdb.europe-west1.firebasedatabase.app"
+  authDomain: "party-speakers.firebaseapp.com",
+  projectId: "party-speakers",
+  databaseURL: "https://party-speakers-default-rtdb.europe-west1.firebasedatabase.app",
+  storageBucket: "party-speakers.firebasestorage.app",
+  messagingSenderId: "110690393103",
+  appId: "1:110690393103:web:78a72284e1be3dbc71d77a"
 };
 const START_DELAY_MS = 2500;      // отложенный старт: команда играть «через 2,5 с серверного времени»
 const DRIFT_CHECK_MS = 10000;     // как часто сверяем позицию
 const DRIFT_SOFT_S   = 0.045;     // > 45 мс — мягкая коррекция скоростью
 const DRIFT_HARD_S   = 0.30;      // > 300 мс — жёсткий перезапуск с нужной позиции
+const FADE_S         = 0.02;      // 20 мс фейд-ин/аут — чтобы пересинхронизация не щёлкала
 const MAX_FILE_MB    = 25;
 const CHUNK_CHARS    = 8000000;   // куски base64 по ~8 млн символов: с запасом ниже лимита БД в 10 МБ на запись
 </script>
@@ -114,7 +127,8 @@ const CHUNK_CHARS    = 8000000;   // куски base64 по ~8 млн симво
   <p class="sub" style="margin:0">Код вечеринки</p>
   <div class="code-big" id="host-code">— — — —</div>
   <img class="qr" id="host-qr" alt="QR для гостей">
-  <p class="muted center" id="host-speakers">Колонок подключено: 0</p>
+  <p class="muted center" id="host-speakers" style="margin-bottom:4px">Колонок подключено: 0</p>
+  <div id="host-speaker-list" class="muted" style="font-size:13px; max-width:320px; margin:0 auto"></div>
 
   <div class="card">
     <div class="controls">
@@ -124,6 +138,10 @@ const CHUNK_CHARS    = 8000000;   // куски base64 по ~8 млн симво
     </div>
     <div style="height:10px"></div>
     <p class="muted center" id="host-nowplaying">Загрузите треки и нажмите play</p>
+    <div id="host-progress" class="progress" style="display:none">
+      <div class="bar"><div class="fill" id="host-progress-fill"></div></div>
+      <div class="row" style="font-size:12px"><span class="muted" id="host-progress-cur">0:00</span><span class="muted" id="host-progress-dur" style="text-align:right">0:00</span></div>
+    </div>
   </div>
 
   <div class="card">
@@ -146,6 +164,7 @@ const CHUNK_CHARS    = 8000000;   // куски base64 по ~8 млн симво
   <div class="speaker-wrap">
     <div class="speaker-btn" id="spk-btn" onclick="speakerTap()">🔊</div>
     <p class="muted center" id="spk-status">Нажмите на динамик, чтобы включиться</p>
+    <p class="center" id="spk-track" style="font-weight:600; color:var(--accent2); min-height:20px; margin:0"></p>
   </div>
   <div class="card">
     <p class="muted" style="margin:0">Громкость</p>
@@ -168,20 +187,23 @@ const CHUNK_CHARS    = 8000000;   // куски base64 по ~8 млн симво
 "use strict";
 // ---------- общий каркас ----------
 let db=null, partyCode=null, role=null;
-let clockOffset=0;                 // serverTime - localTime (мс)
+let clockOffset=0, clockReady=false; // serverTime - localTime (мс)
 let audioCtx=null, gainNode=null, masterVol=1;
 let nudgeMs = parseInt(localStorage.getItem('ps_nudge')||'0');
 let buffers={};                    // trackId -> AudioBuffer
 let rawTracks={};                  // trackId -> {name, order}
 let curState=null;                 // последний state из базы
-let playingSrc=null, playInfo=null; // playInfo: {trackId, ctxStart, posAtStart, rate}
+let playingSrc=null, playEnv=null, playInfo=null; // playInfo: {trackId, ctxStart, posAtStart, rate}
 let speakerOn=false, myUid='u'+Math.random().toString(36).slice(2,9);
-let driftTimer=null, heartbeatTimer=null;
+let myName = localStorage.getItem('ps_name') || ('Колонка '+myUid.slice(-3).toUpperCase());
+let driftTimer=null, heartbeatTimer=null, hostProgTimer=null;
 
 function $(id){return document.getElementById(id);}
 function show(id){document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active')); $(id).classList.add('active');}
 function toast(msg){const t=$('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),3000);}
 function serverNow(){return Date.now()+clockOffset;}
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function fmtTime(s){s=Math.max(0,Math.floor(s||0)); return Math.floor(s/60)+':'+('0'+(s%60)).slice(-2);}
 // ---------- экранный лог диагностики ----------
 function dbg(msg, cls){
   try{
@@ -203,7 +225,13 @@ function initFirebase(){
   }
   firebase.initializeApp(FIREBASE_CONFIG);
   db=firebase.database();
-  db.ref('.info/serverTimeOffset').on('value', s=>{ clockOffset = s.val()||0; dbg('сдвиг часов относительно сервера: '+Math.round(clockOffset)+' мс'); });
+  db.ref('.info/serverTimeOffset').on('value', s=>{
+    const v = s.val()||0;
+    // Сглаживаем (EMA): резкие скачки оценки сдвига не должны дёргать синхронизацию.
+    clockOffset = clockReady ? clockOffset*0.7 + v*0.3 : v;
+    clockReady = true;
+    dbg('сдвиг часов относительно сервера: '+Math.round(clockOffset)+' мс');
+  });
   db.ref('.info/connected').on('value', s=>{ dbg('связь с базой: '+(s.val()?'есть':'нет'), s.val()?'ok':'err'); });
   return true;
 }
@@ -249,6 +277,7 @@ function createParty(){
   listenParty();
   show('scr-host');
   requestWakeLock();
+  if(!hostProgTimer) hostProgTimer=setInterval(updateHostProgress, 500);
 }
 
 function joinParty(codeFromUrl){
@@ -260,8 +289,10 @@ function joinParty(codeFromUrl){
     partyCode=code; role='speaker';
     $('spk-code').textContent=code;
     listenParty();
+    const meRef=db.ref('parties/'+partyCode+'/speakers/'+myUid);
+    meRef.onDisconnect().remove();   // ушёл/закрыл вкладку → пропал из списка колонок
     heartbeatTimer=setInterval(()=>{
-      db.ref('parties/'+partyCode+'/speakers/'+myUid).set({lastSeen:firebase.database.ServerValue.TIMESTAMP, on:speakerOn});
+      meRef.set({lastSeen:firebase.database.ServerValue.TIMESTAMP, on:speakerOn, name:myName, nudge:nudgeMs});
     },15000);
     show('scr-speaker');
   });
@@ -273,7 +304,7 @@ function listenParty(){
   db.ref(base+'/tracks').on('child_added', async s=>{
     const v=s.val();
     rawTracks[s.key]={name:v.name, order:v.order};
-    if(role==='host') renderPlaylist();
+    if(role==='host') renderPlaylist(); else updateSpeakerTrack();
     // Новый формат: трек порезан на куски в отдельной ветке. Старый: всё в поле data.
     if(v.chunks){
       try{
@@ -288,17 +319,35 @@ function listenParty(){
       decodeTrack(s.key, v.data);
     }
   });
+  // Переименование/переупорядочивание треков.
+  db.ref(base+'/tracks').on('child_changed', s=>{
+    const v=s.val(); if(!v) return;
+    rawTracks[s.key]={name:v.name, order:v.order};
+    if(role==='host') renderPlaylist(); else updateSpeakerTrack();
+  });
+  // Удаление трека хостом.
+  db.ref(base+'/tracks').on('child_removed', s=>{
+    delete rawTracks[s.key]; delete buffers[s.key];
+    if(role==='host') renderPlaylist(); else updateSpeakerTrack();
+  });
   db.ref(base+'/state').on('value', s=>{
     curState=s.val();
     if(curState) dbg('получена команда: '+curState.action+(curState.trackId?' · трек '+(rawTracks[curState.trackId]?rawTracks[curState.trackId].name:curState.trackId):''));
     onStateChange();
-    if(role==='host') renderHostState();
+    if(role==='host') renderHostState(); else updateSpeakerTrack();
   });
   if(role==='host'){
     db.ref(base+'/speakers').on('value', s=>{
-      let n=0; const now=serverNow();
-      s.forEach(c=>{ const v=c.val(); if(v.on && now-(v.lastSeen||0)<45000) n++; });
+      let n=0; const now=serverNow(); const rows=[];
+      s.forEach(c=>{
+        const v=c.val()||{}; const alive = now-(v.lastSeen||0)<45000;
+        if(v.on && alive) n++;
+        if(alive) rows.push({name:v.name||('Колонка '+c.key.slice(-3)), on:!!v.on, nudge:v.nudge||0});
+      });
       $('host-speakers').textContent='Колонок подключено: '+n;
+      $('host-speaker-list').innerHTML = rows.length
+        ? rows.map(r=>`<div class="spk-row"><span class="status-dot ${r.on?'ok':''}"></span>${escapeHtml(r.name)}${r.nudge?` <span class="muted">(${r.nudge>0?'+':''}${r.nudge} мс)</span>`:''}</div>`).join('')
+        : '<span class="muted">Пока никто не подключился</span>';
     });
   }
 }
@@ -331,7 +380,20 @@ function outputLatencyS(){
 }
 
 function stopLocal(){
-  if(playingSrc){ try{playingSrc.stop();}catch(e){} playingSrc=null; }
+  if(playingSrc){
+    const s=playingSrc, e=playEnv;
+    try{
+      if(e && audioCtx && audioCtx.state==='running'){
+        const t=audioCtx.currentTime;
+        e.gain.cancelScheduledValues(t);
+        e.gain.setValueAtTime(e.gain.value, t);
+        e.gain.linearRampToValueAtTime(0, t+FADE_S);   // короткий фейд-аут — без щелчка
+        s.stop(t+FADE_S+0.02);
+      }else{ s.stop(); }
+    }catch(err){}
+    playingSrc=null;
+  }
+  playEnv=null;
   playInfo=null;
   if(driftTimer){ clearInterval(driftTimer); driftTimer=null; }
   updateSpeakerVisual(false);
@@ -356,25 +418,34 @@ function startSynced(st, buf){
   if(targetPos >= buf.duration) return;                       // трек уже кончился
 
   const src=audioCtx.createBufferSource();
-  src.buffer=buf; src.connect(gainNode);
+  src.buffer=buf;
+  const env=audioCtx.createGain();     // индивидуальный envelope на этот проигрыш (для фейдов)
+  env.connect(gainNode); src.connect(env);
   const nudgeS = nudgeMs/1000;
 
+  let startCtxTime, startPos;
   if(elapsedS < 0){
     // старт в будущем: планируем по аудиочасам с точностью до сэмпла
     const when = audioCtx.currentTime + (-elapsedS) - outputLatencyS() - nudgeS;
-    src.start(Math.max(when, audioCtx.currentTime), st.seekOffset);
-    playInfo={trackId:st.trackId, ctxStart:Math.max(when,audioCtx.currentTime), posAtStart:st.seekOffset, rate:1};
+    startCtxTime = Math.max(when, audioCtx.currentTime);
+    startPos = st.seekOffset;
   }else{
     // подключились посреди трека: входим с нужной позиции
-    const pos = targetPos + outputLatencyS() + nudgeS;
-    src.start(audioCtx.currentTime, Math.min(pos, buf.duration-0.05));
-    playInfo={trackId:st.trackId, ctxStart:audioCtx.currentTime, posAtStart:pos, rate:1};
+    startCtxTime = audioCtx.currentTime;
+    startPos = Math.min(targetPos + outputLatencyS() + nudgeS, buf.duration-0.05);
   }
-  playingSrc=src;
+  src.start(startCtxTime, startPos);
+  // фейд-ин: жёсткая пересинхронизация/вход посреди трека не даёт щелчка
+  env.gain.setValueAtTime(0, startCtxTime);
+  env.gain.linearRampToValueAtTime(1, startCtxTime + FADE_S);
+  playInfo={trackId:st.trackId, ctxStart:startCtxTime, posAtStart:startPos, rate:1};
+
+  playingSrc=src; playEnv=env;
   src.onended=()=>{ if(role==='host' && playingSrc===src) hostNext(true); };
   updateSpeakerVisual(true);
   dbg('▶ играю «'+(rawTracks[st.trackId]?rawTracks[st.trackId].name:'')+'» с позиции '+playInfo.posAtStart.toFixed(2)+'с','ok');
   driftTimer=setInterval(checkDrift, DRIFT_CHECK_MS);
+  setTimeout(checkDrift, 1500);        // ранняя первая сверка — быстрее подхватываем рассинхрон
 }
 
 function currentLocalPos(){
@@ -408,12 +479,48 @@ let trackOrder=[]; let uploadCounter=0;
 function renderPlaylist(){
   trackOrder=Object.keys(rawTracks).sort((a,b)=>rawTracks[a].order-rawTracks[b].order);
   const cur = curState && curState.trackId;
-  $('playlist').innerHTML = trackOrder.map(id=>
+  $('playlist').innerHTML = trackOrder.map((id,i)=>
     `<div class="track ${id===cur?'current':''}">
        <span class="status-dot ${buffers[id]?'ok':''}"></span>
-       <span class="name">${rawTracks[id].name}</span>
-       <button onclick="hostPlayTrack('${id}')">▶</button>
+       <span class="name">${escapeHtml(rawTracks[id].name)}</span>
+       <button title="Вверх" onclick="moveTrack('${id}',-1)" ${i===0?'disabled':''}>▲</button>
+       <button title="Вниз" onclick="moveTrack('${id}',1)" ${i===trackOrder.length-1?'disabled':''}>▼</button>
+       <button title="Играть" onclick="hostPlayTrack('${id}')">▶</button>
+       <button class="del" title="Удалить" onclick="deleteTrack('${id}')">✕</button>
      </div>`).join('');
+}
+function moveTrack(id, dir){
+  const i=trackOrder.indexOf(id), j=i+dir;
+  if(i<0 || j<0 || j>=trackOrder.length) return;
+  const a=trackOrder[i], b=trackOrder[j];
+  const oa=rawTracks[a].order, ob=rawTracks[b].order;
+  // меняем местами порядковые номера — обновится у всех через child_changed
+  db.ref('parties/'+partyCode+'/tracks/'+a+'/order').set(ob);
+  db.ref('parties/'+partyCode+'/tracks/'+b+'/order').set(oa);
+}
+async function deleteTrack(id){
+  const name=rawTracks[id] ? rawTracks[id].name : '';
+  const isCur = curState && curState.trackId===id;
+  if(isCur){
+    if(trackOrder.length>1) hostNext(true);           // переключиться на другой трек
+    else setState({action:'stop', trackId:'', seekOffset:0, startAt:0});
+  }
+  try{
+    await db.ref('parties/'+partyCode+'/trackdata/'+id).remove();
+    await db.ref('parties/'+partyCode+'/tracks/'+id).remove();
+    toast('Удалён: '+name);
+  }catch(e){ toast('Не удалось удалить: '+(e&&e.message||e)); }
+}
+function updateHostProgress(){
+  const box=$('host-progress'); if(!box) return;
+  const st=curState;
+  if(!(st && st.action==='play' && buffers[st.trackId])){ box.style.display='none'; return; }
+  const dur=buffers[st.trackId].duration;
+  const pos=Math.max(0, Math.min(st.seekOffset + (serverNow()-st.startAt)/1000, dur));
+  box.style.display='block';
+  $('host-progress-fill').style.width=(dur? pos/dur*100 : 0)+'%';
+  $('host-progress-cur').textContent=fmtTime(pos);
+  $('host-progress-dur').textContent=fmtTime(dur);
 }
 function renderHostState(){
   renderPlaylist();
@@ -499,8 +606,13 @@ function speakerTap(){
   dbg('колонка '+(speakerOn?'ВКЛ':'выкл'));
   $('spk-btn').classList.toggle('on', speakerOn);
   $('spk-status').textContent = speakerOn ? 'Колонка включена. Ждём музыку…' : 'Нажмите на динамик, чтобы включиться';
-  db.ref('parties/'+partyCode+'/speakers/'+myUid).set({lastSeen:firebase.database.ServerValue.TIMESTAMP, on:speakerOn});
+  db.ref('parties/'+partyCode+'/speakers/'+myUid).set({lastSeen:firebase.database.ServerValue.TIMESTAMP, on:speakerOn, name:myName, nudge:nudgeMs});
   onStateChange();
+}
+function updateSpeakerTrack(){
+  if(role!=='speaker') return;
+  const st=curState;
+  $('spk-track').textContent = (st && st.action==='play' && rawTracks[st.trackId]) ? rawTracks[st.trackId].name : '';
 }
 function updateSpeakerVisual(playing){
   if(role!=='speaker') return;

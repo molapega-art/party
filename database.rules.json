@@ -1,0 +1,58 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+
+    "parties": {
+      "$code": {
+        ".read": "$code.matches(/^[0-9]{4}$/)",
+        ".write": "$code.matches(/^[0-9]{4}$/)",
+
+        "meta": {
+          "createdAt": { ".validate": "newData.isNumber()" },
+          "$other": { ".validate": false }
+        },
+
+        "state": {
+          "action":     { ".validate": "newData.isString() && newData.val().length < 16" },
+          "trackId":    { ".validate": "newData.isString() && newData.val().length < 64" },
+          "seekOffset": { ".validate": "newData.isNumber()" },
+          "startAt":    { ".validate": "newData.isNumber()" },
+          "$other":     { ".validate": false }
+        },
+
+        "speakers": {
+          "$uid": {
+            "lastSeen": { ".validate": "newData.isNumber()" },
+            "on":       { ".validate": "newData.isBoolean()" },
+            "name":     { ".validate": "newData.isString() && newData.val().length < 40" },
+            "nudge":    { ".validate": "newData.isNumber() && newData.val() >= -500 && newData.val() <= 500" },
+            "$other":   { ".validate": false }
+          }
+        },
+
+        "tracks": {
+          "$id": {
+            "name":        { ".validate": "newData.isString() && newData.val().length < 200" },
+            "order":       { ".validate": "newData.isNumber()" },
+            "chunks":      { ".validate": "newData.isNumber()" },
+            "size":        { ".validate": "newData.isNumber()" },
+            "duration":    { ".validate": "newData.isNumber()" },
+            "url":         { ".validate": "newData.isString() && newData.val().length < 2000" },
+            "storagePath": { ".validate": "newData.isString() && newData.val().length < 300" },
+            "data":        { ".validate": "newData.isString()" },
+            "$other":      { ".validate": false }
+          }
+        },
+
+        "trackdata": {
+          "$id": {
+            "$chunk": { ".validate": "newData.isString() && newData.val().length <= 8500000" }
+          }
+        },
+
+        "$other": { ".validate": false }
+      }
+    }
+  }
+}
